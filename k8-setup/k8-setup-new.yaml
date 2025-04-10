@@ -1,0 +1,164 @@
+---
+- name: Kubernetes HA Prerequisites with Keepalived and HAProxy
+  hosts: masters
+  become: yes
+  vars:
+    vip: "11.0.1.240"
+    interface: "eth0"
+
+  tasks:
+    - name: Set hostname
+      hostname:
+        name: "{{ inventory_hostname }}"
+
+    - name: Add all hosts to /etc/hosts
+      lineinfile:
+        path: /etc/hosts
+        line: "{{ hostvars[item].ansible_host }} {{ hostvars[item].hostname }}"
+        state: present
+      loop: "{{ groups['masters'] }}"
+
+    - name: Disable SELinux
+      selinux:
+        state: disabled
+
+    - name: Disable swap
+      shell: swapoff -a && sed -i '/swap/d' /etc/fstab
+
+    - name: Install basic packages
+      yum:
+        name:
+          - curl
+          - wget
+          - vim
+          - git
+          - net-tools
+          - yum-utils
+          - device-mapper-persistent-data
+          - lvm2
+          - socat
+          - iproute-tc
+        state: present
+        disable_gpg_check: true
+
+    - name: Load kernel modules
+      copy:
+        dest: /etc/modules-load.d/k8s.conf
+        content: |
+          overlay
+          br_netfilter
+
+    - name: Enable kernel modules
+      shell: modprobe overlay && modprobe br_netfilter
+
+    - name: Set sysctl params
+      copy:
+        dest: /etc/sysctl.d/k8s.conf
+        content: |
+          net.bridge.bridge-nf-call-iptables  = 1
+          net.ipv4.ip_forward                 = 1
+          net.bridge.bridge-nf-call-ip6tables = 1
+
+    - name: Apply sysctl params
+      command: sysctl --system
+
+    - name: Add Docker repo for containerd
+      shell: yum-config-manager --add-repo https://download.docker.com/linux/centos/docker-ce.repo
+
+    - name: Install containerd
+      shell: |
+        yum install -y containerd.io
+        mkdir -p /etc/containerd
+        containerd config default > /etc/containerd/config.toml
+        sed -i 's/SystemdCgroup = false/SystemdCgroup = true/' /etc/containerd/config.toml
+        systemctl restart containerd && systemctl enable containerd
+
+    - name: Add Kubernetes repo (v1.30)
+      copy:
+        dest: /etc/yum.repos.d/kubernetes.repo
+        content: |
+          [kubernetes]
+          name=Kubernetes
+          baseurl=https://pkgs.k8s.io/core:/stable:/v1.30/rpm/
+          enabled=1
+          gpgcheck=1
+          repo_gpgcheck=1
+          gpgkey=https://pkgs.k8s.io/core:/stable:/v1.30/rpm/repodata/repomd.xml.key
+          exclude=kubelet kubeadm kubectl cri-tools kubernetes-cni
+
+    - name: Clean YUM cache
+      shell: yum clean all
+
+    - name: Remove old cache
+      file:
+        path: /var/cache/yum
+        state: absent
+
+    - name: Make cache for YUM
+      shell: yum makecache
+
+    - name: Install Kubernetes packages
+      shell: |
+        yum install -y kubelet kubeadm kubectl --disableexcludes=kubernetes
+
+    - name: Enable kubelet
+      systemd:
+        name: kubelet
+        enabled: yes
+
+    - name: Install HAProxy
+      yum:
+        name: haproxy
+        state: present
+
+    - name: Configure HAProxy
+      copy:
+        dest: /etc/haproxy/haproxy.cfg
+        content: |
+          global
+              log /dev/log    local0
+              maxconn 2048
+              daemon
+
+          defaults
+              mode tcp
+              timeout connect 10s
+              timeout client  1m
+              timeout server  1m
+
+          frontend kubernetes
+              bind *:8443
+              default_backend kube_apiservers
+
+          backend kube_apiservers
+              balance roundrobin
+              option tcp-check
+              server k8s-master-1 11.0.1.79:6443 check
+              server k8s-master-2 11.0.1.36:6443 check
+              server k8s-master-3 11.0.1.223:6443 check
+      notify: Restart haproxy
+
+    - name: Install Keepalived
+      yum:
+        name: keepalived
+        state: present
+
+    - name: Configure Keepalived
+      template:
+        src: keepalived.conf.j2
+        dest: /etc/keepalived/keepalived.conf
+      notify: Restart keepalived
+
+  handlers:
+    - name: Restart haproxy
+      systemd:
+        name: haproxy
+        state: restarted
+        enabled: yes
+
+    - name: Restart keepalived
+      systemd:
+        name: keepalived
+        state: restarted
+        enabled: yes
+
