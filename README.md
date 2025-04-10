@@ -1,112 +1,139 @@
-# Kubernetes HA Setup with Keepalived and HAProxy (Rocky Linux)
-
-This repository contains a complete setup for provisioning a production-grade **Highly Available (HA)** Kubernetes control plane using:
-
-- **Keepalived** for Virtual IP (VIP) failover
-- **HAProxy** for load balancing kube-apiserver
-- **Kubeadm** to bootstrap the Kubernetes cluster
-
-> ✅ This setup was validated and debugged end-to-end, and contains notes on pitfalls (like SELinux) and validation steps.
+# Kubernetes HA Cluster with Keepalived + HAProxy (Ansible Automated)
 
 ---
 
-## 🌐 Cluster Details
+## 🖥️ OS Image Details
+- **AMI ID:** `ami-0219bfb6c89d10de5`
+- **OS:** CentOS Stream 9 (Rocky Linux-compatible)
+- **Region:** `ap-south-1`
 
-| Component    | Value                |
-|--------------|----------------------|
-| VIP          | `11.0.1.240`         |
-| HAProxy Port | `8443`               |
-| Nodes        | 3 masters (no worker)|
-| OS           | Rocky Linux 9        |
-| Container Runtime | containerd     |
-| Kubernetes Version | v1.30.x (YUM repo) |
+---
+
+## 📦 Setup Overview
+This project automates the setup of a Highly Available Kubernetes control plane using:
+- **Keepalived** for VIP failover
+- **HAProxy** for load balancing to kube-apiservers
+- **Ansible** to automate the complete setup
+
+---
+
+## ✅ Completed Components
+- [x] VIP setup using Keepalived
+- [x] HAProxy config to forward traffic to `kube-apiserver`
+- [x] Kubernetes pre-requisites installed (containerd, kernel modules, sysctl)
+- [x] SELinux disabled (🔴 was the key issue!)
+- [x] Kubeadm init with HA endpoint `11.0.1.240:8443`
+- [x] HAProxy listens on `:8443` to forward to ports `:6443` of each master
 
 ---
 
 ## 📁 Folder Structure
-
-```
-├── inventory.ini                  # Ansible inventory file
-├── k8s-setup.yaml                # Main Ansible playbook
+```bash
+k8s-ha-setup/
+├── inventory.ini              # Ansible inventory with master IPs
+├── k8s-setup.yaml             # Ansible Playbook (prereqs + K8s + HAProxy + Keepalived)
 ├── templates/
-│   └── keepalived.conf.j2        # Keepalived configuration template
-├── files/
-│   └── master-aws-key.pem        # SSH key (not in repo)
-└── README.md                     # This file
+│   └── keepalived.conf.j2     # Dynamic Keepalived template with role priorities
+├── README.md                  # This documentation
 ```
 
 ---
 
-## ⚙️ Prerequisites Setup (Automated via Ansible)
+## 📋 Step-by-step Setup
 
-### System Configuration:
-- Set hostnames from Ansible inventory
-- Add all master node IPs to `/etc/hosts`
-- Disable swap
-- Disable SELinux (🔴 This was the main culprit during validation)
-- Kernel modules & sysctl for Kubernetes networking
+### 1. Create 3 EC2 Instances with below Private IPs:
+| Hostname       | Private IP  |
+|----------------|-------------|
+| k8s-master-1   | 11.0.1.79   |
+| k8s-master-2   | 11.0.1.36   |
+| k8s-master-3   | 11.0.1.223  |
 
-### Package Install:
-- `curl`, `wget`, `vim`, `git`, `net-tools`, `socat`, `iproute-tc`, etc.
-- Docker repo for installing `containerd`
-- Configure `containerd` to use `SystemdCgroup`
 
-### Kubernetes Repo:
-- Uses official repo from `pkgs.k8s.io` for v1.30
-- Installs `kubelet`, `kubeadm`, `kubectl`
+### 2. SSH Access
+Ensure all nodes are reachable via SSH using:
+```bash
+ssh -i /tmp/master-aws-key.pem rocky@11.0.1.79
+```
 
-### HA Configuration:
-- Install and configure `haproxy` to bind to `*:8443`
-- Setup `keepalived` with proper priorities and VIP configuration
+### 3. Prepare Inventory File
+```ini
+[masters]
+k8s-master-1 ansible_host=11.0.1.79 hostname=k8s-master-1 priority=101
+k8s-master-2 ansible_host=11.0.1.36 hostname=k8s-master-2 priority=100
+k8s-master-3 ansible_host=11.0.1.223 hostname=k8s-master-3 priority=99
 
----
+[all:vars]
+ansible_user=rocky
+ansible_ssh_private_key_file=/tmp/master-aws-key.pem
+vip=11.0.1.240
+interface=eth0
+```
 
-## 🧪 Validation Checklist
+### 4. Run Playbook
+```bash
+ansible-playbook -i inventory.ini k8s-setup.yaml
+```
 
-### 🔁 Virtual IP Failover (Keepalived)
-- Checked with: `ip a | grep 11.0.1.240` (only one node should hold it)
-- Manual restart of keepalived to simulate failover
-- Validated gratuitous ARP broadcast with `journalctl -u keepalived -f`
+### 5. Init First Master
+```bash
+sudo kubeadm init --control-plane-endpoint "11.0.1.240:8443" --upload-certs
+```
 
-### ⚖️ HAProxy Connectivity
-- Verified HAProxy binds to `8443`: `ss -ltnp | grep 8443`
-- Checked API forwarding: `curl -k https://localhost:6443/livez`
-- Then validated via HAProxy: `curl -k https://11.0.1.240:8443/livez`
-- `nc -zv 11.0.1.240 8443` from all masters to confirm reachability
-
-### 🧵 kubeadm Init Success
-- Bootstrap cluster with VIP as control-plane endpoint:
-  ```bash
-  sudo kubeadm init \
-    --control-plane-endpoint "11.0.1.240:8443" \
-    --upload-certs
-  ```
-- Watch pods spin up in `/etc/kubernetes/manifests`
-
-### ✅ Final Kubernetes Health
-- `kubectl get nodes` from master
-- `curl -k https://11.0.1.240:8443/livez` returns `ok`
-- HAProxy logs show backends are healthy (no Layer4 failures)
+### 6. Setup Kubeconfig
+```bash
+mkdir -p $HOME/.kube
+sudo cp /etc/kubernetes/admin.conf $HOME/.kube/config
+sudo chown $(id -u):$(id -g) $HOME/.kube/config
+```
 
 ---
 
-## 🚨 Gotchas (Lessons Learned)
+## ✅ Validation Steps
 
-| Issue | Root Cause | Fix |
-|-------|------------|-----|
-| `curl -k https://VIP:PORT` fails | SELinux blocking HAProxy | ✅ Disable SELinux
-| `kubectl` times out | HAProxy config error or wrong port | ✅ Fixed port to `8443`, used `tcp-check`
-| HAProxy healthcheck fails | Wrong option (`check` instead of `tcp-check`) | ✅ Use `option tcp-check` in config
+### 🔁 HAProxy Check
+```bash
+curl -k https://localhost:8443/livez
+curl -k https://11.0.1.240:8443/livez
+```
+
+### 🔁 VIP Check
+```bash
+ip a | grep 11.0.1.240
+ping 11.0.1.240
+```
+Ensure only one master holds the VIP.
+
+### 🔁 kube-apiserver Check
+```bash
+crictl ps -a | grep kube-apiserver
+sudo ss -ltnp | grep 6443
+```
+
+---
+
+## ⚠️ Key Issue Faced
+- SELinux **not disabled** caused `Permission denied` on HAProxy → kube-apiserver TCP connections
+- ✅ Fixed by adding SELinux disable in playbook:
+```yaml
+- name: Disable SELinux permanently
+  copy:
+    dest: /etc/selinux/config
+    content: |
+      SELINUX=disabled
+      SELINUXTYPE=targeted
+- name: Disable SELinux now
+  command: setenforce 0
+  ignore_errors: true
+```
 
 ---
 
 ## 🚀 Next Steps
-
-- [ ] Add worker node automation
-- [ ] Join remaining masters via `kubeadm join --control-plane`
-- [ ] Push this repo to GitHub with `README.md` and `.gitignore`
+- Automate joining the 2nd and 3rd master using `kubeadm join`
+- Add worker node setup
+- Add CNI plugin (like Calico)
+- Enable monitoring with Prometheus + Grafana
 
 ---
 
-## 💬 Credits
-This setup and battle-hardened troubleshooting was done by Ravi with help from ChatGPT 🙂. Kudos for sticking through hours of debugging to get this done right!
+> Last Updated: {{ date }}
