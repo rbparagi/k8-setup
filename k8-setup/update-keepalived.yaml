@@ -1,0 +1,16 @@
+- name: Update Keepalived Configuration Only
+  hosts: masters
+  become: yes
+  tasks:
+    - name: Update Keepalived config with VIP fix
+      template:
+        src: keepalived.conf.j2
+        dest: /etc/keepalived/keepalived.conf
+      notify: Restart keepalived
+
+  handlers:
+    - name: Restart keepalived
+      systemd:
+        name: keepalived
+        state: restarted
+        enabled: yes

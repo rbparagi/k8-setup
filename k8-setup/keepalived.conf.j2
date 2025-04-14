@@ -2,14 +2,21 @@ vrrp_instance VI_1 {
     state BACKUP
     interface {{ interface }}
     virtual_router_id 51
-    priority {{ priority | default(100) }}
+    priority {{ priority }}
     advert_int 1
     authentication {
         auth_type PASS
-        auth_pass 1234
+        auth_pass 42keepalive
     }
+
+    unicast_src_ip {{ ansible_host }}
+    unicast_peer {
+    {% for host in groups['masters'] if hostvars[host].ansible_host != ansible_host %}
+        {{ hostvars[host].ansible_host }}
+    {% endfor %}
+    }
+
     virtual_ipaddress {
         {{ vip }}
     }
 }
-
